@@ -1,68 +1,74 @@
-from paddleocr import PaddleOCR
+"""PaddleOCR inference and Maharashtra HSC marksheet extraction."""
+
 import re
 
-ocr = PaddleOCR(
-    lang="en",
-)
+from paddleocr import PaddleOCR
+
+
+ocr = PaddleOCR(lang="en")
+
+_SUBJECT_PREFIX = re.compile(r"^\s*(\d{1,3})\s*[-.]?\s*([A-Z][A-Z &()/.-]*)\s*$", re.I)
+_EXAM_PATTERN = re.compile(r"\b(JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|OCTOBER|NOVEMBER|DECEMBER)[ -](\d{4})\b", re.I)
+
+
+def _group_rows(detections, tolerance):
+    """Group OCR boxes by their vertical centers, then order each row left to right."""
+    rows = []
+    for item in sorted(detections, key=lambda value: value["y"]):
+        row = next((candidate for candidate in rows
+                    if abs(item["y"] - sum(x["y"] for x in candidate) / len(candidate)) <= tolerance), None)
+        if row is None:
+            rows.append([item])
+        else:
+            row.append(item)
+    for row in rows:
+        row.sort(key=lambda value: value["x"])
+    return rows
+
+
+def _text(detections):
+    return " ".join(item["text"] for item in detections).strip()
+
 
 def extract_marksheet(image_path):
     result = ocr.predict(image_path)
-
     detections = []
+    image_width = image_height = None
 
     for res in result:
-        texts = res["rec_texts"]
-        scores = res["rec_scores"]
-        boxes = res["rec_polys"]
-
+        texts = res.get("rec_texts", [])
+        scores = res.get("rec_scores", [])
+        boxes = res.get("rec_polys", [])
         for text, score, box in zip(texts, scores, boxes):
-            text = text.strip()
-
-            if not text:
+            text = str(text).strip()
+            if not text or float(score) < 0.35:
                 continue
-
-            if score < 0.50:
-                continue
-
-            x_min = box[:, 0].min()
-            y_min = box[:, 1].min()
-            x_max = box[:, 0].max()
-            y_max = box[:, 1].max()
-            center_x = (x_min + x_max) / 2
-            center_y = (y_min + y_max) / 2
-
+            xs = [float(point[0]) for point in box]
+            ys = [float(point[1]) for point in box]
+            x_min, x_max = min(xs), max(xs)
+            y_min, y_max = min(ys), max(ys)
+            image_width = max(image_width or 0, x_max)
+            image_height = max(image_height or 0, y_max)
             detections.append({
                 "text": text,
                 "score": float(score),
-                "x": float(center_x),
-                "y": float(center_y)
+                "x": (x_min + x_max) / 2,
+                "y": (y_min + y_max) / 2,
+                "height": y_max - y_min,
             })
 
+    if not detections:
+        return {"exam": None, "seat_no": None, "centre_no": None,
+                "school_index_no": None, "subjects": [], "total_marks": None,
+                "percentage": None}
 
-    detections.sort(key=lambda item: item["y"])
-    # Group into rows
-    rows = []
-    Y_TOLERANCE = 25
-
+    # Normalize positions so the same column logic works across scan resolutions.
+    width = image_width or 1
+    height = image_height or 1
     for item in detections:
-        added = False
-
-        for row in rows:
-            row_y = sum(
-                x["y"] for x in row
-            ) / len(row)
-
-            if abs(item["y"] - row_y) <= Y_TOLERANCE:
-                row.append(item)
-                added = True
-                break
-
-        if not added:
-            rows.append([item])
-
-    # Sort left → right
-    for row in rows:
-        row.sort(key=lambda item: item["x"])
+        item["nx"] = item["x"] / width
+        item["ny"] = item["y"] / height
+    rows = _group_rows(detections, max(8, height * 0.012))
 
     marksheet = {
         "exam": None,
@@ -71,77 +77,104 @@ def extract_marksheet(image_path):
         "school_index_no": None,
         "subjects": [],
         "total_marks": None,
-        "percentage": None
+        "percentage": None,
     }
 
-    # Extract exam + seat number
+    # The exam month/year may be printed as FEBRUARY-2002 or FEBRUARY 2002.
     for item in detections:
-        text = item["text"]
-        upper_text = text.upper()
+        match = _EXAM_PATTERN.search(item["text"].upper().replace("–", "-").replace("—", "-"))
+        if match:
+            marksheet["exam"] = f"{match.group(1).upper()}-{match.group(2)}"
+        if re.fullmatch(r"[A-Z]?\s*\d{5,8}", item["text"].upper().replace("O", "0")):
+            candidate = re.sub(r"\s+", "", item["text"]).upper()
+            # OCR often reads a zero in the numeric part of an alphanumeric
+            # seat number as the letter O (for example, M064043 as MO64043).
+            if candidate and candidate[0].isalpha():
+                candidate = candidate[0] + candidate[1:].replace("O", "0")
+            else:
+                candidate = candidate.replace("O", "0")
+            if any(char.isdigit() for char in candidate):
+                marksheet["seat_no"] = candidate
 
-        if re.search(
-            r"(MAY|JUNE|APRIL|MARCH)-\d{4}",
-            upper_text
-        ):
-            marksheet["exam"] = text
-
-        if re.fullmatch(
-            r"G\s?\d{6}",
-            upper_text
-        ):
-            marksheet["seat_no"] = text
-
-    # Percentage
-    for item in detections:
-        if re.fullmatch(
-            r"\d{2}\.\d{2}",
-            item["text"]
-        ):
-            marksheet["percentage"] = float(
-                item["text"]
-            )
-
-    # Total marks
-    for item in detections:
-        if "FOUR HUNDRED THIRTY FIVE" in item["text"].upper():
-            marksheet["total_marks"] = 435
-
-    # Subjects
+    # Pull header values from the same horizontal band as their labels, using
+    # the fixed printed columns (seat, centre, school index) rather than guesses
+    # based on numeric order.
     for row in rows:
-        row_text = " ".join(
-            item["text"]
-            for item in row
-        )
-        if "SUBJECT" in row_text.upper():
+        y = sum(item["ny"] for item in row) / len(row)
+        if not 0.12 <= y <= 0.31:
             continue
-
-        subject_match = re.search(
-            r"\b(\d{3})\s+(.+)",
-            row_text
-        )
-
-        if not subject_match:
-            continue
-
-        code = subject_match.group(1)
-        name = subject_match.group(2).strip()
-        numbers = []
-
         for item in row:
-            if re.fullmatch(
-                r"\d+",
-                item["text"]
-            ):
-                numbers.append(item["text"])
+            value = item["text"].strip()
+            if re.fullmatch(r"\d{2,4}", value) and 0.30 <= item["nx"] <= 0.54:
+                marksheet["centre_no"] = value
+            elif re.fullmatch(r"\d{1,3}\.\d{2,4}", value) and 0.46 <= item["nx"] <= 0.62:
+                marksheet["school_index_no"] = value
 
-        if len(numbers) < 2:
+    # Also recognize header value detections if PaddleOCR placed them on a
+    # separate row from the labels.
+    for item in detections:
+        value = item["text"].strip()
+        if 0.12 <= item["ny"] <= 0.31:
+            if re.fullmatch(r"\d{2,4}", value) and 0.30 <= item["nx"] <= 0.54:
+                marksheet["centre_no"] = value
+            if re.fullmatch(r"\d{1,3}\.\d{2,4}", value) and 0.46 <= item["nx"] <= 0.62:
+                marksheet["school_index_no"] = value
+
+    for item in detections:
+        match = re.fullmatch(r"(\d{1,3})\.(\d{2})", item["text"].strip())
+        if match:
+            marksheet["percentage"] = float(item["text"])
+
+    for row in rows:
+        row_text = _text(row)
+        upper = row_text.upper()
+        # A total row has the label and typically both the maximum and obtained
+        # totals in their own columns. The obtained total is the rightmost
+        # numeric value in the figures columns.
+        if "TOTAL" in upper and ("MARK" in upper or "गुण" in upper or "600" in upper):
+            values = []
+            for item in row:
+                if 0.46 <= item["nx"] <= 0.68:
+                    found = re.findall(r"\b\d{1,4}\b", item["text"])
+                    values.extend((int(number), item["nx"]) for number in found)
+            if values:
+                marksheet["total_marks"] = max(values, key=lambda pair: pair[1])[0]
             continue
 
+        # Subject names sit in the broad left-hand table column. Codes may be
+        # combined with the name ("01 ENGLISH") or detected in a separate box.
+        left = [item for item in row if item["nx"] < 0.42]
+        code = name = None
+        for item in left:
+            match = _SUBJECT_PREFIX.match(item["text"].upper())
+            if match and re.search(r"[A-Z]", match.group(2)):
+                code, name = match.group(1), match.group(2).strip(" .-")
+                break
+        if code is None:
+            code_item = next((item for item in left if re.fullmatch(r"\d{1,3}", item["text"].strip())), None)
+            name_items = [item for item in left if re.search(r"[A-Za-z]{2,}", item["text"])]
+            if code_item and name_items:
+                code = code_item["text"].strip()
+                name = " ".join(item["text"].strip() for item in name_items).upper()
+        if not code or not name or not re.search(r"[A-Z]{2}", name):
+            continue
+
+        column_numbers = []
+        for item in row:
+            if not (0.46 <= item["nx"] <= 0.69):
+                continue
+            token = item["text"].strip().replace("O", "0").replace("o", "0")
+            if re.fullmatch(r"\d{1,3}", token):
+                column_numbers.append((item["nx"], int(token)))
+        max_values = [value for x, value in column_numbers if 0.46 <= x < 0.57]
+        obtained_values = [value for x, value in column_numbers if 0.55 <= x <= 0.69]
+        if not max_values or not obtained_values:
+            continue
         marksheet["subjects"].append({
             "code": code,
-            "name": name,
-            "max_marks": int(numbers[0]),
-            "obtained_marks": int(numbers[1])
+            "name": re.sub(r"\s+", " ", name).strip(),
+            "max_marks": max_values[0],
+            "obtained_marks": obtained_values[0],
         })
 
     return marksheet
