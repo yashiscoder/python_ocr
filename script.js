@@ -130,7 +130,7 @@ extractBtn.addEventListener("click", async () => {
     try {
 
         const response = await fetch(
-            "https://python-ocr-9jib.onrender.com/ocr",
+            "https://hassle-defensive-unpaid.ngrok-free.dev/ocr",
             {
                 method: "POST",
                 body: formData
