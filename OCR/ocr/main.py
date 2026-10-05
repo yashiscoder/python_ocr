@@ -1,9 +1,10 @@
 from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from ocr_service import extract_marksheet
 import tempfile
 import os
 from ocr_service import extract_marksheet
-from fastapi.middleware.cors import CORSMiddleware
+
 
 app = FastAPI(
     title="OCR",
